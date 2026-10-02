@@ -138,13 +138,23 @@ func (t *Tools) inRepo(ctx context.Context, dir string) bool {
 	return err == nil && strings.TrimSpace(out) == "true"
 }
 
+// gitStatusDetail is used by the diagnostic path to explain a failed check.
+func (t *Tools) gitProbe(ctx context.Context, dir string) string {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		return "git not on PATH"
+	}
+	out, runErr := t.gitRun(ctx, dir, "rev-parse", "--is-inside-work-tree")
+	return fmt.Sprintf("dir=%s git=%s out=%q err=%v", dir, git, strings.TrimSpace(out), runErr)
+}
+
 func (t *Tools) gitStatus(ctx context.Context, args map[string]any) (string, error) {
 	dir, err := t.Sandbox.Resolve(strArg(args, "cwd", "."))
 	if err != nil {
 		return "", err
 	}
 	if !t.inRepo(ctx, dir) {
-		return "", fmt.Errorf("not a git repository: %s", t.Sandbox.Rel(dir))
+		return "", fmt.Errorf("not a git repository: %s (%s)", t.Sandbox.Rel(dir), t.gitProbe(ctx, dir))
 	}
 	branch, _ := t.gitRun(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD")
 	status, err := t.gitRun(ctx, dir, "status", "--short", "--untracked-files=all")

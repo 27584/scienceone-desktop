@@ -1,4 +1,4 @@
-module github.com/yg/panshi-desktop
+module github.com/yg/scienceone-desktop
 
 go 1.27.0
 

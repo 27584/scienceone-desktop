@@ -236,20 +236,7 @@ func (t *Tools) readFile(args map[string]any) (string, error) {
 
 	lines := strings.Split(string(raw), "\n")
 	total := len(lines)
-	start := intArg(args, "start_line", 1)
-	if start < 1 {
-		start = 1
-	}
-	if start > total {
-		start = total
-	}
-	end := intArg(args, "end_line", total)
-	if end > total {
-		end = total
-	}
-	if end < start {
-		end = start
-	}
+	start, end := lineWindow(args, total)
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# %s (lines %d-%d of %d)\n", t.Sandbox.Rel(file), start, end, total)
@@ -257,9 +244,9 @@ func (t *Tools) readFile(args map[string]any) (string, error) {
 		fmt.Fprintf(&sb, "%d\t%s\n", i+1, lines[i])
 	}
 
-	hint := "[output was cut by size; read a smaller range with start_line and end_line]"
+	hint := "[output was cut by size; read a smaller range with offset and limit]"
 	if end < total {
-		hint = fmt.Sprintf("[the file continues to line %d; call read_file again with start_line=%d]", total, end+1)
+		hint = fmt.Sprintf("[the file continues to line %d; call read again with offset=%d]", total, end+1)
 	}
 	return truncate(sb.String(), maxRead, hint), nil
 }
@@ -472,8 +459,8 @@ func (t *Tools) runShell(ctx context.Context, args map[string]any) (string, erro
 	if body == "" {
 		body = "(no output)"
 	}
-	out := fmt.Sprintf("exit=%d%s%s\n%s\n%s",
-		res.ExitCode, note, HintFor(res.Output, res.ExitCode), EnvLine(t.Sandbox.Root), body)
+	out := fmt.Sprintf("%s%s%s\n%s\n%s",
+		exitTag(res.ExitCode), note, HintFor(res.Output, res.ExitCode), EnvLine(t.Sandbox.Root), body)
 	return truncate(out, maxOutput,
 		"[output was too long; re-run with a filter such as `| tail -50` or `-q` to see the middle]"), nil
 }

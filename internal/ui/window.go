@@ -36,7 +36,18 @@ type Status struct {
 	ToolCount   int    `json:"toolCount"`
 	TunnelURL   string `json:"tunnelUrl"`
 	TunnelState string `json:"tunnelState"`
-	Workspace   string `json:"workspace"`
+	// TunnelProvider names the backend in use ("cloudflared" or "frp"), so the
+	// panel can say where the address came from.
+	TunnelProvider string `json:"tunnelProvider"`
+	// TunnelWarm is true once the public address has actually answered. A quick
+	// tunnel hands out its URL before its edge route is live, and the platform
+	// refuses to save an entry whose URL does not answer it.
+	TunnelWarm bool   `json:"tunnelWarm"`
+	// TunnelWhy explains a tunnel that never became reachable, in the words the
+	// transport used. "预热中" on its own left a broken tunnel and a slow one
+	// looking identical.
+	TunnelWhy string `json:"tunnelWhy"`
+	Workspace  string `json:"workspace"`
 	Token       string `json:"token"`
 }
 
@@ -61,7 +72,7 @@ func (a *App) Run() {
 
 	dataDir := a.cfg.DataDir
 	if dataDir == "" {
-		dataDir = filepath.Join(os.TempDir(), "panshi-desktop-webview")
+		dataDir = filepath.Join(os.TempDir(), "scienceone-desktop-webview")
 	}
 	_ = os.MkdirAll(dataDir, 0o755)
 
@@ -71,7 +82,7 @@ func (a *App) Run() {
 		// A persistent profile means the platform stays logged in between runs.
 		DataPath: dataDir,
 		WindowOptions: webview2.WindowOptions{
-			Title:  "磐石桌面 · Panshi Desktop",
+			Title:  "ScienceOne Desktop Bridge",
 			Width:  1360,
 			Height: 900,
 			Center: true,
@@ -91,7 +102,7 @@ func (a *App) Run() {
 	// point where the panel can be guaranteed to beat the page's own scripts.
 	view.Init(bridgeJS)
 
-	if err := view.Bind("panshiNative", a.handle); err != nil {
+	if err := view.Bind("scienceoneNative", a.handle); err != nil {
 		fmt.Fprintln(os.Stderr, "无法绑定桥接函数:", err)
 	}
 
@@ -206,25 +217,38 @@ type fillPayload struct {
 	AuthText        string `json:"authText"`
 	DocumentName    string `json:"documentName"`
 	DocumentContent string `json:"documentContent"`
-	Error           string `json:"error,omitempty"`
+	// Warm says whether the tunnel has answered at least once, and WarmWhy says
+	// why it has not when it has not.
+	Warm    bool   `json:"warm"`
+	WarmWhy string `json:"warmWhy,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 func (a *App) fillConfig() fillPayload {
 	s := a.status()
 	if s.MCPURL == "" {
-		return fillPayload{Error: "公网地址尚未就绪，等隧道连上再试"}
+		// The address is what the platform stores, so without it there is
+		// nothing to write. The panel waits and retries; the state and the last
+		// tunnel error are surfaced so a persistent failure is diagnosable.
+		detail := s.TunnelState
+		if detail == "" {
+			detail = "unknown"
+		}
+		return fillPayload{Error: "隧道状态=" + detail}
 	}
 	return fillPayload{
 		// The name field accepts only letters, digits, underscore and hyphen,
 		// so it cannot carry a Chinese label.
 		Name:            "desktop",
-		Description:     "访问本机开发者工作站：浏览工程目录、读写源码、按片段打补丁、正则检索、执行构建与测试命令、用默认程序打开文件。当任务需要读写用户本机上的文件或运行本机命令时才使用本工具；纯文本问答、网页检索、以及磐石自身就能完成的产物生成，优先用平台原生能力。",
+		Description:     "访问本机开发者工作站：浏览工程目录、读写源码、按片段打补丁、正则检索、执行构建与测试命令、用默认程序打开文件。当任务需要读写用户本机上的文件或运行本机命令时才使用本工具；纯文本问答、网页检索、以及ScienceOne自身就能完成的产物生成，优先用平台原生能力。",
 		MCPURL:          s.MCPURL,
 		Headers:         "X-MCP-Token=" + a.cfg.Token,
 		ProtocolText:    "Streamable HTTP",
 		AuthText:        "自定义请求头",
 		DocumentName:    a.cfg.DocName,
 		DocumentContent: a.cfg.DocContent,
+		Warm:            s.TunnelWarm,
+		WarmWhy:         s.TunnelWhy,
 	}
 }
 

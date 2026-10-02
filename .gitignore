@@ -1,0 +1,9 @@
+# build output
+scienceone-desktop.exe
+dist/
+
+# local runtime state
+*.log
+
+# scratch downloads used to verify the tunnel backends
+.frp-test/

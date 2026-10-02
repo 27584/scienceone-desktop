@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Control exposes the injected automation over local HTTP so it can be driven
@@ -38,17 +39,28 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	action := strings.TrimPrefix(r.URL.Path, "/control/")
 	var js string
 	switch action {
+	case "eval":
+		// Run arbitrary JS in the page. The endpoint is bound to loopback and
+		// gated on the same token as everything else, and it exists because every
+		// question about this UI — where is the tool menu, what does this button
+		// do — is answered faster by asking the page than by guessing at it.
+		code := r.URL.Query().Get("js")
+		if code == "" {
+			writeControlJSON(w, map[string]any{"error": "eval needs ?js="})
+			return
+		}
+		js = wrapped("eval", code)
 	case "probe":
-		js = "window.__panshiDesktopAPI.probe()"
+		js = "window.__scienceoneDesktopAPI.probe()"
 	case "fill":
-		js = "window.__panshiDesktopAPI.fill()"
+		js = "window.__scienceoneDesktopAPI.fill()"
 	case "open":
-		js = "window.__panshiDesktopAPI.state.open = true; window.__panshiDesktopAPI.refresh()"
+		js = "window.__scienceoneDesktopAPI.state.open = true; window.__scienceoneDesktopAPI.refresh()"
 	case "fields":
 		// Which element each label resolves to, and what it looks like — the
 		// only way to tell a mis-resolved label from a picker that will not open.
 		js = wrapped("fields", `
-			var api = window.__panshiDesktopAPI;
+			var api = window.__scienceoneDesktopAPI;
 			var out = [];
 			[['名称','text'],['描述','text'],['URL','text'],['鉴权方式','picker'],['学科','picker']].forEach(function(pair){
 				var el = api.fieldByLabel(pair[0], pair[1]);
@@ -64,7 +76,7 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Diff the DOM across a click: whatever appears is the dropdown, and its
 		// markup is the only reliable thing to match on.
 		js = wrapped("picker", `
-			var api = window.__panshiDesktopAPI;
+			var api = window.__scienceoneDesktopAPI;
 			var el = api.fieldByLabel(LABEL, 'picker');
 			if (!el) return 'control not found';
 
@@ -93,7 +105,7 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				var after = snapshot();
 				var fresh = [];
 				for (var k in after) { if (!before[k]) fresh.push(k); }
-				window.__panshiCall('report', { msg: 'control:picker-result',
+				window.__scienceoneCall('report', { msg: 'control:picker-result',
 					data: fresh.length ? fresh.slice(0,25).join(' ~ ') : 'nothing new appeared' });
 			}, 1000);
 			return 'opened';
@@ -103,7 +115,7 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Read the form back. A screenshot shows what looks filled; this shows
 		// what the framework actually holds.
 		js = wrapped("values", `
-			var api = window.__panshiDesktopAPI;
+			var api = window.__scienceoneDesktopAPI;
 			var scope = api.findFormScope();
 			var out = [];
 			[['名称','text'],['描述','text'],['URL','text'],['鉴权方式','picker'],['学科','picker']].forEach(function(pair){
@@ -127,18 +139,25 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return out.join('\n') + '\n--- all non-empty ---\n' + extra.join('\n');
 		`)
 	case "area":
-		// Dump the dialog top-to-bottom with positions, so a region can be
-		// identified by where it sits rather than by guessing class names.
+		// Dump the elements of a region with positions, so a layout can be read
+		// off by where things sit rather than by guessing class names.
+		// raw=1 scans the whole document and keeps icon-only controls, which
+		// carry no text at all and are skipped otherwise.
+		raw := "false"
+		if r.URL.Query().Get("raw") != "" {
+			raw = "true"
+		}
 		js = wrapped("area", `
-			var api = window.__panshiDesktopAPI;
-			var scope = api.findFormScope();
+			var RAW = @RAW@;
+			var api = window.__scienceoneDesktopAPI;
+			var scope = RAW ? document : api.findFormScope();
 			var rows = [];
 			var all = scope.querySelectorAll('*');
 			for (var i = 0; i < all.length; i++) {
 				var el = all[i];
 				var r = el.getBoundingClientRect();
 				if (r.width === 0 || r.height === 0) continue;
-				if (r.height > 260) continue;               // skip whole-form wrappers
+				if (r.height > 400) continue;               // skip page wrappers
 				var own = '';
 				for (var k = 0; k < el.childNodes.length; k++) {
 					if (el.childNodes[k].nodeType === 3) own += el.childNodes[k].textContent;
@@ -146,7 +165,7 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				own = own.trim();
 				var val = el.value !== undefined ? el.value : '';
 				var ph = el.getAttribute ? (el.getAttribute('placeholder') || '') : '';
-				if (!own && !val && !ph && el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') continue;
+				if (!RAW && !own && !val && !ph && el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') continue;
 				rows.push({
 					y: Math.round(r.top), x: Math.round(r.left),
 					w: Math.round(r.width), h: Math.round(r.height),
@@ -156,11 +175,36 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				});
 			}
 			rows.sort(function(a, b) { return a.y - b.y || a.x - b.x; });
-			return rows.map(function(r) {
+			return rows.slice(0, 400).map(function(r) {
 				return r.y + ',' + r.x + ' ' + r.w + 'x' + r.h + ' ' + r.tag + '.' + r.cls +
 					(r.text ? ' T=' + JSON.stringify(r.text) : '') +
 					(r.val ? ' V=' + JSON.stringify(r.val) : '') +
 					(r.ph ? ' P=' + JSON.stringify(r.ph) : '');
+			}).join('\n');
+		`)
+		js = strings.ReplaceAll(js, "@RAW@", raw)
+	case "text":
+		// Dump the visible leaf text of the page top-to-bottom. Needed to read
+		// back what the platform actually stored (the detail view), which no
+		// dialog-scoped probe can reach.
+		js = wrapped("text", `
+			var out = [], seen = {};
+			var all = document.querySelectorAll('body *');
+			for (var i = 0; i < all.length; i++) {
+				var el = all[i];
+				if (el.children.length > 0) continue;
+				var r = el.getBoundingClientRect();
+				if (r.width === 0 || r.height === 0) continue;
+				var t = (el.textContent || '').trim();
+				if (!t || t.length > 90) continue;
+				var key = Math.round(r.top) + ':' + t;
+				if (seen[key]) continue;
+				seen[key] = 1;
+				out.push([Math.round(r.top), Math.round(r.left), t]);
+			}
+			out.sort(function(a, b) { return a[0] - b[0] || a[1] - b[1]; });
+			return out.slice(0, 80).map(function(r) {
+				return r[0] + ',' + r[1] + ' ' + r[2];
 			}).join('\n');
 		`)
 	case "click":
@@ -216,16 +260,142 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		`)
 		js = strings.ReplaceAll(js, "X", xs)
 		js = strings.ReplaceAll(js, "Y", ys)
+	case "submit":
+		// Press the primary button and explain what happened. A dialog that
+		// stays open with no visible error usually means a required field is
+		// unset in the framework's own state, not in the DOM.
+		js = wrapped("submit", `
+			var api = window.__scienceoneDesktopAPI;
+			var scope = api.findFormScope();
+
+			function report(tag) {
+				var out = [tag];
+				var files = document.querySelectorAll('input[type=file]');
+				for (var i = 0; i < files.length; i++) {
+					out.push('fileInput[' + i + '].files=' + (files[i].files ? files[i].files.length : 'n/a'));
+				}
+				// Any text that looks like a validation complaint, however it is styled.
+				var all = scope.querySelectorAll('*');
+				var msgs = [];
+				for (var j = 0; j < all.length; j++) {
+					var el = all[j];
+					if (el.children.length > 0) continue;
+					var r = el.getBoundingClientRect();
+					if (r.width === 0 || r.height === 0) continue;
+					var t = (el.textContent || '').trim();
+					if (!t || t.length > 50) continue;
+					if (/必填|必选|不能为空|请选择|请上传|请填写|格式|required|invalid/i.test(t)) {
+						msgs.push('"' + t + '"');
+					}
+				}
+				out.push('validation: ' + (msgs.length ? msgs.slice(0, 6).join(' | ') : 'none'));
+				// The primary button, by its own class rather than by its label.
+				var prim = scope.querySelector('[class*=primary-btn],button.mcp-create-primary-btn');
+				if (prim) {
+					out.push('primary: disabled=' + !!prim.disabled +
+						' aria=' + (prim.getAttribute('aria-disabled') || '-') +
+						' cls=' + String(prim.className).slice(0, 50));
+				} else {
+					out.push('primary: not found');
+				}
+				return out.join(' | ');
+			}
+
+			var before = report('BEFORE');
+			var btn = scope.querySelector('[class*=primary-btn]') ||
+				api.findClickable('确认', scope) || api.findClickable('确认更新', scope);
+			if (!btn) return before + ' || NO BUTTON';
+			btn.click();
+			return before + ' || clicked ' + String(btn.className).slice(0, 40);
+		`)
+	case "after":
+		js = wrapped("after", `
+			var api = window.__scienceoneDesktopAPI;
+			var scope = api.findFormScope();
+			var out = [];
+			out.push('dialogStillOpen=' + (scope !== document));
+			if (scope !== document) {
+				var all = scope.querySelectorAll('*');
+				var msgs = [];
+				for (var j = 0; j < all.length; j++) {
+					var el = all[j];
+					if (el.children.length > 0) continue;
+					var r = el.getBoundingClientRect();
+					if (r.width === 0 || r.height === 0) continue;
+					var t = (el.textContent || '').trim();
+					if (!t || t.length > 50) continue;
+					if (/必填|必选|不能为空|请选择|请上传|请填写|格式|required|invalid|失败|错误/i.test(t)) {
+						msgs.push('"' + t + '"');
+					}
+				}
+				out.push('messages: ' + (msgs.length ? msgs.slice(0, 6).join(' | ') : 'none'));
+			}
+			return out.join(' | ');
+		`)
 	case "goto":
 		// Navigate the window, so a whole flow can be driven from outside.
+		//
+		// A one-shot query value is added on purpose. Navigating to a URL that
+		// differs only in its hash does not reload the document, and this SPA
+		// does not notice a hash change made from outside itself — the address
+		// moved while the view stayed on the previous page. Changing the query
+		// forces a real document load, so the router always starts from the
+		// requested route.
 		target := r.URL.Query().Get("url")
 		if target == "" {
 			writeControlJSON(w, map[string]any{"error": "goto needs ?url="})
 			return
 		}
+		head, frag := target, ""
+		if i := strings.Index(target, "#"); i >= 0 {
+			head, frag = target[:i], target[i:]
+		}
+		sep := "?"
+		if strings.Contains(head, "?") {
+			sep = "&"
+		}
+		target = head + sep + "_nav=" + strconv.FormatInt(time.Now().UnixNano(), 36) + frag
 		c.App.navigate(target)
 		writeControlJSON(w, map[string]any{"navigated": target})
 		return
+	case "cards":
+		// Dump every element whose own text is one of the list entries, with its
+		// ancestor chain — enough to see which element a click would actually hit.
+		js = wrapped("cards", `
+			var wanted = ['desktop', 'local-dev-mcp'];
+			var out = [];
+			var all = document.querySelectorAll('*');
+			for (var i = 0; i < all.length; i++) {
+				var el = all[i];
+				var t = (el.textContent || '').trim();
+				if (wanted.indexOf(t) === -1) continue;
+				var r = el.getBoundingClientRect();
+				if (r.width === 0 || r.height === 0) continue;
+				var chain = [];
+				var cur = el;
+				for (var d = 0; d < 5 && cur && cur !== document.body; d++) {
+					chain.push(cur.tagName.toLowerCase() + '.' + String(cur.className || '').split(' ').slice(0,2).join('.'));
+					cur = cur.parentElement;
+				}
+				out.push('T="' + t + '" <' + el.tagName.toLowerCase() + '.' + String(el.className).slice(0,40) +
+					'> @' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+					'  chain: ' + chain.join(' < '));
+			}
+			// What the click would actually land on, by hit-testing the centre.
+			var hits = [];
+			for (var j = 0; j < wanted.length; j++) {
+				var api = window.__scienceoneDesktopAPI;
+				var el2 = api.findClickable(wanted[j]);
+				if (!el2) { hits.push(wanted[j] + ' -> findClickable returned null'); continue; }
+				var rr = el2.getBoundingClientRect();
+				var cx = rr.left + rr.width / 2, cy = rr.top + rr.height / 2;
+				var top = document.elementFromPoint(cx, cy);
+				hits.push(wanted[j] + ' -> picked <' + el2.tagName.toLowerCase() + '.' +
+					String(el2.className).slice(0,30) + '> centre ' + Math.round(cx) + ',' + Math.round(cy) +
+					'; elementFromPoint = <' + (top ? top.tagName.toLowerCase() + '.' + String(top.className).slice(0,30) : 'none') + '>');
+			}
+			return out.join('\n') + '\n--- hit test ---\n' + hits.join('\n');
+		`)
 	case "page":
 		// Location plus visible buttons plus open dialogs. This is what tells
 		// "the save worked" apart from "there was nothing to click".
@@ -293,8 +463,12 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		`)
 	default:
 		writeControlJSON(w, map[string]any{
-			"error":   "unknown action",
-			"actions": []string{"probe", "fill", "open", "fields", "picker", "values", "area", "click", "goto", "page"},
+			"error": "unknown action",
+			// Kept in sync by listing what the switch actually handles.
+			"actions": []string{
+				"probe", "fill", "open", "fields", "picker", "values", "area",
+				"click", "clickxy", "goto", "page", "cards", "submit", "after",
+			},
 		})
 		return
 	}
@@ -307,8 +481,8 @@ func (c *Control) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // webview's Eval does not return a value to the caller.
 func wrapped(label, body string) string {
 	return "(function(){try{var v=(function(){" + body + "})();" +
-		"window.__panshiCall('report',{msg:'control:" + label + "',data:v});" +
-		"}catch(e){window.__panshiCall('report',{msg:'control:" + label + " error',data:String(e)});}})()"
+		"window.__scienceoneCall('report',{msg:'control:" + label + "',data:v});" +
+		"}catch(e){window.__scienceoneCall('report',{msg:'control:" + label + " error',data:String(e)});}})()"
 }
 
 func writeControlJSON(w http.ResponseWriter, v any) {

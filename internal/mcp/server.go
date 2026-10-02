@@ -53,6 +53,20 @@ type rpcResponse struct {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Logged before the auth check. The platform refuses to save an entry whose
+	// URL it judges unreachable, and whether its probe ever arrived here is the
+	// only way to tell a network problem from a protocol one.
+	s.Log("request", map[string]any{
+		"method":     r.Method,
+		"path":       r.URL.Path,
+		"query":      firstRunes(r.URL.RawQuery, 200),
+		"ua":         r.UserAgent(),
+		"accept":     r.Header.Get("Accept"),
+		"ctype":      r.Header.Get("Content-Type"),
+		"remote":     r.RemoteAddr,
+		"authorized": s.authorized(r),
+	})
+
 	if !s.authorized(r) {
 		s.Log("unauthorized", map[string]any{"remote": r.RemoteAddr, "path": r.URL.Path})
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -64,7 +78,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Some clients probe for an SSE stream before posting. Answer with a
 		// description instead of holding the connection open forever.
 		writeJSON(w, http.StatusOK, map[string]any{
-			"server":    "panshi-desktop",
+			"server":    "scienceone-desktop",
 			"transport": "streamable-http",
 			"tools":     toolNames(),
 		})
@@ -132,7 +146,7 @@ func (s *Server) dispatch(ctx context.Context, req *rpcRequest) (*rpcResponse, b
 				// Echo the caller's version so every client generation is satisfied.
 				"protocolVersion": p.ProtocolVersion,
 				"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
-				"serverInfo":      map[string]any{"name": "panshi-desktop", "version": Version},
+				"serverInfo":      map[string]any{"name": "scienceone-desktop", "version": Version},
 			},
 		}, true
 
@@ -173,35 +187,35 @@ func (s *Server) errorResponse(id json.RawMessage, code int, msg string) *rpcRes
 }
 
 func (s *Server) callTool(ctx context.Context, name string, args map[string]any) (string, bool) {
-	if args == nil {
-		args = map[string]any{}
-	}
+	args = normalizeArgs(args)
 	var (
 		text string
 		err  error
 	)
+	// Names follow the mainstream harness convention; the older spellings are
+	// still accepted so an existing configuration keeps working.
 	switch name {
-	case "list_dir":
+	case "ls", "list_dir":
 		text, err = s.Tools.listDir(args)
-	case "read_file":
+	case "read", "read_file":
 		text, err = s.Tools.readFile(args)
-	case "write_file":
+	case "readLines", "read_lines":
+		text, err = s.Tools.readLines(args)
+	case "write", "write_file":
 		text, err = s.Tools.writeFile(args)
-	case "apply_patch":
+	case "edit", "apply_patch":
 		text, err = s.Tools.applyPatch(args)
-	case "search_code":
-		text, err = s.Tools.searchCode(args)
-	case "find_files":
+	case "glob", "find_files":
 		text, err = s.Tools.findFiles(args)
-	case "replace_in_files":
-		text, err = s.Tools.replaceInFiles(args)
-	case "git_status":
-		text, err = s.Tools.gitStatus(ctx, args)
-	case "git_diff":
-		text, err = s.Tools.gitDiff(ctx, args)
-	case "run_shell":
+	case "grep", "search_code":
+		text, err = s.Tools.searchCode(args)
+	case "todoWrite", "todo_write":
+		text, err = s.Tools.todoWrite(args)
+	case "bash", "run_shell":
 		text, err = s.Tools.runShell(ctx, args)
-	case "open_path":
+	case "pwsh":
+		text, err = s.Tools.runPwsh(ctx, args)
+	case "open", "open_path":
 		text, err = s.Tools.openPath(args)
 	case "ping":
 		text = s.Tools.ping()

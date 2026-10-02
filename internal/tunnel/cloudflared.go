@@ -21,16 +21,6 @@ import (
 	"time"
 )
 
-// Status is what the control panel renders.
-type Status struct {
-	State     string    `json:"state"` // stopped | starting | up | retrying
-	URL       string    `json:"url"`
-	Target    string    `json:"target"`
-	Since     time.Time `json:"since"`
-	Restarts  int       `json:"restarts"`
-	LastError string    `json:"lastError"`
-}
-
 var (
 	urlRe   = regexp.MustCompile(`https://[a-zA-Z0-9][a-zA-Z0-9-]*\.trycloudflare\.com`)
 	ansiRe  = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
@@ -220,11 +210,18 @@ func (c *Cloudflared) MCPURL(path string) string {
 	return strings.TrimSuffix(base, "/") + path
 }
 
+// SetOnURL registers the address callback. Call it before Start: the supervisor
+// goroutine reads the field without holding the lock.
+func (c *Cloudflared) SetOnURL(fn func(string)) {
+	c.OnURL = fn
+}
+
 func (c *Cloudflared) Status() Status {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return Status{
 		State:     c.state,
+		Provider:  "cloudflared",
 		URL:       c.url,
 		Target:    c.Target,
 		Since:     c.since,

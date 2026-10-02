@@ -8,10 +8,10 @@
  *      Chinese labels, which survive UI refactors far better than class names
  */
 (function () {
-  if (window.__panshiDesktop) return;
-  window.__panshiDesktop = true;
+  if (window.__scienceoneDesktop) return;
+  window.__scienceoneDesktop = true;
 
-  var HOST_ID = 'panshi-desktop-panel';
+  var HOST_ID = 'scienceone-desktop-panel';
 
   // -------------------------------------------------------------------------
   // bridge to the native side
@@ -19,22 +19,41 @@
 
   function call(action, payload) {
     return new Promise(function (resolve, reject) {
-      if (typeof window.panshiNative !== 'function') {
+      if (typeof window.scienceoneNative !== 'function') {
         reject(new Error('native bridge not available'));
         return;
       }
-      Promise.resolve(window.panshiNative(JSON.stringify({ action: action, payload: payload || {} })))
+      // The native side answers on the UI thread. If that thread is blocked the
+      // promise never settles and the whole flow would hang silently, so every
+      // call is bounded and the failure is visible in the panel log.
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (!settled) {
+          settled = true;
+          reject(new Error('native call timed out: ' + action));
+        }
+      }, 8000);
+
+      Promise.resolve(window.scienceoneNative(JSON.stringify({ action: action, payload: payload || {} })))
         .then(function (raw) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           try {
             resolve(JSON.parse(raw));
           } catch (e) {
             reject(new Error('bad response: ' + String(raw).slice(0, 200)));
           }
         })
-        .catch(reject);
+        .catch(function (e) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(e);
+        });
     });
   }
-  window.__panshiCall = call;
+  window.__scienceoneCall = call;
 
   /**
    * Tell the native side what the injection is doing. Without this, a page the
@@ -270,19 +289,40 @@
     return el;
   }
 
-  /** Find a clickable element by its visible text, exact match first. */
+  /**
+   * Find a clickable element by its visible text.
+   *
+   * Exact match wins, and a card title is preferred over any other element with
+   * the same text: the list shows both "local-dev-mcp" and "desktop" with
+   * identical descriptions, so matching loosely lands on the wrong entry.
+   */
   function findClickable(text, root) {
     var scope = root || document;
-    var els = scope.querySelectorAll('button,a,div,span,li,p,h1,h2,h3,h4,strong');
+    var els = scope.querySelectorAll(
+      '.card-title, button, a, div, span, li, p, h1, h2, h3, h4, strong'
+    );
     var loose = null;
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
       if (!visible(el)) continue;
       var t = (el.textContent || '').trim();
-      if (t === text) return clickableAncestor(el);
-      if (!loose && t.length <= 12 && t.indexOf(text) !== -1) loose = el;
+      if (t === text) {
+        if (el.classList && el.classList.contains('card-title')) {
+          // Click the card itself rather than the heading inside it: the card
+          // owns the navigation handler, and its centre is a larger target.
+          return el.closest('[class*=card], li, article') || el;
+        }
+        if (!loose) loose = el;
+      }
     }
-    return loose ? clickableAncestor(loose) : null;
+    if (loose) return clickableAncestor(loose);
+    for (var j = 0; j < els.length; j++) {
+      var e2 = els[j];
+      if (!visible(e2)) continue;
+      var t2 = (e2.textContent || '').trim();
+      if (t2.length <= 12 && t2.indexOf(text) !== -1) return clickableAncestor(e2);
+    }
+    return null;
   }
 
   /** Just the text control for a label, for callers that do not care how. */
@@ -458,22 +498,82 @@
     });
   }
 
-  /** Attach an in-memory file to a file input, the only way to satisfy one programmatically. */
-  function attachFile(input, name, content, mime) {
-    var file = new File([content], name, { type: mime || 'text/markdown' });
-    var dt = new DataTransfer();
-    dt.items.add(file);
-    input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
+  /**
+   * Attach the document to the upload widget.
+   *
+   * Two channels are tried, because a component-library uploader accepts a file
+   * without necessarily keeping it on the input element:
+   *   - assign to every <input type=file> and fire input/change
+   *   - drop the file on the area that advertises "点击或拖拽上传"
+   *
+   * Success is judged by the interface, not by input.files: uploaders commonly
+   * clear the input afterwards so the same file can be picked again, which makes
+   * a file count read as zero even though the attachment worked.
+   */
+  async function attachDocument(scope, name, content) {
+    var file = new File([content], name, { type: 'text/markdown' });
+
+    function assign(input) {
+      try {
+        var dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function shown() {
+      // The form echoes the file name once it is attached.
+      var els = (scope || document).querySelectorAll('div,span,strong,p,li');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (el.children.length > 0 || !visible(el)) continue;
+        var t = (el.textContent || '').trim();
+        if (t === name || t.indexOf(name) !== -1) return true;
+      }
+      return false;
+    }
+
+    var inputs = (scope || document).querySelectorAll('input[type=file]');
+    for (var i = 0; i < inputs.length; i++) assign(inputs[i]);
+    await sleep(1500);
+    if (shown()) return { ok: true, detail: 'attached ' + name };
+
+    var zone = findDropZone(scope);
+    if (zone) {
+      try {
+        var dt2 = new DataTransfer();
+        dt2.items.add(file);
+        ['dragenter', 'dragover', 'drop'].forEach(function (type) {
+          zone.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+        });
+      } catch (e) {
+        /* fall through to the verification below */
+      }
+      await sleep(1500);
+      if (shown()) return { ok: true, detail: 'attached ' + name + ' (via drop)' };
+    }
+
+    return {
+      ok: false,
+      detail: 'file inputs=' + inputs.length + ', drop zone=' + (zone ? 'yes' : 'no') + ', name not shown',
+    };
   }
 
-  function findFileInput(root) {
-    var scope = root || document;
-    var inputs = scope.querySelectorAll('input[type=file]');
-    for (var i = 0; i < inputs.length; i++) {
-      if (visible(inputs[i]) || inputs[i].offsetParent !== null) return inputs[i];
+  /** The upload area that advertises drag-and-drop. */
+  function findDropZone(scope) {
+    var els = (scope || document).querySelectorAll('div,section,label');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!visible(el)) continue;
+      var t = (el.textContent || '').trim();
+      if (t.indexOf('拖拽') !== -1 || t.indexOf('上传说明') !== -1) return el;
     }
-    return inputs.length ? inputs[0] : null;
+    return null;
   }
 
   function sleep(ms) {
@@ -539,6 +639,100 @@
       cur = cur.parentElement;
     }
     return '';
+  }
+
+  // -------------------------------------------------------------------------
+  // click recorder
+  // -------------------------------------------------------------------------
+
+  /**
+   * Write down every click the user makes, with the element's ancestor chain.
+   *
+   * Some controls on this platform only appear under a real mouse hover, which
+   * synthetic events cannot reproduce — so the only reliable way to learn where
+   * a menu lives is to have the user open it once while every click they make is
+   * being recorded. Guessing from screenshots cost hours; this costs one click.
+   */
+  function recordClicks() {
+    if (window.__scienceoneClickLog) {
+      pushLog('已经在记录了，请直接去点开那个开关');
+      return 'already recording';
+    }
+    window.__scienceoneClickLog = [];
+    document.addEventListener('click', function (e) {
+      var chain = [];
+      var cur = e.target;
+      for (var d = 0; d < 6 && cur && cur !== document.body; d++) {
+        var t = (cur.textContent || '').trim();
+        chain.push(
+          cur.tagName.toLowerCase() +
+            '.' + String(cur.className).slice(0, 48) +
+            (t && t.length <= 26 ? ' T=' + JSON.stringify(t) : '')
+        );
+        cur = cur.parentElement;
+      }
+      if (window.__scienceoneClickLog.length < 40) {
+        window.__scienceoneClickLog.push(chain[0]);
+      }
+      // Show it in the panel as well as logging it, so the user can see that
+      // the recording is live while they are clicking around.
+      pushLog('点击 → ' + String(chain[0] || '').slice(0, 76));
+      render();
+      call('report', {
+        msg: 'USER CLICK @' + Math.round(e.clientX) + ',' + Math.round(e.clientY),
+        data: chain.join('\n    < '),
+      });
+    }, true);
+    pushLog('● 开始记录点击 — 现在去点开那个 MCP 开关，点完这里会显示');
+    return 'recording';
+  }
+
+  // -------------------------------------------------------------------------
+  // input blocker
+  // -------------------------------------------------------------------------
+
+  var BLOCKER_ID = 'scienceone-desktop-blocker';
+
+  /**
+   * Swallow the user's input while the automation drives the page.
+   *
+   * Synthetic events bypass hit-testing, so a full-screen catcher stops clicks,
+   * wheel and keys from the user without touching el.click() or
+   * dispatchEvent() — which is exactly the split wanted: the flow keeps working
+   * and a stray click cannot move the page out from under it mid-edit.
+   */
+  function blockInput(on) {
+    var el = document.getElementById(BLOCKER_ID);
+    if (!on) {
+      if (el) el.remove();
+      return;
+    }
+    if (el) return;
+    el = document.createElement('div');
+    el.id = BLOCKER_ID;
+    el.style.cssText =
+      'position:fixed;inset:0;z-index:2147483646;cursor:progress;background:transparent';
+    ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'wheel',
+      'keydown', 'keyup', 'keypress', 'touchstart', 'touchend'].forEach(function (t) {
+      el.addEventListener(t, function (e) { e.stopPropagation(); e.preventDefault(); }, true);
+    });
+    document.body.appendChild(el);
+  }
+
+  // -------------------------------------------------------------------------
+  // last saved address
+  // -------------------------------------------------------------------------
+
+  var LAST_SAVED_KEY = 'scienceone-desktop:lastSavedURL';
+
+  // The edit form does not back-fill the saved address, so the page cannot be
+  // asked "is this already up to date" — the field is always empty. The answer
+  // therefore has to be remembered from the last time a save succeeded.
+  function lastSavedURL() {
+    try { return localStorage.getItem(LAST_SAVED_KEY) || ''; } catch (e) { return ''; }
+  }
+  function markSavedURL(url) {
+    try { localStorage.setItem(LAST_SAVED_KEY, url); } catch (e) { /* not fatal */ }
   }
 
   // -------------------------------------------------------------------------
@@ -609,13 +803,8 @@
     }
 
     if (cfg.documentContent) {
-      var fi = findFileInput(scope);
-      if (fi) {
-        attachFile(fi, cfg.documentName || 'local-dev-mcp.md', cfg.documentContent);
-        note('document', true, 'attached ' + (cfg.documentName || 'local-dev-mcp.md'));
-      } else {
-        note('document', false, 'no file input on this page');
-      }
+      var doc = await attachDocument(scope, cfg.documentName || 'local-dev-mcp.md', cfg.documentContent);
+      note('document', doc.ok, doc.detail);
     }
 
     return report;
@@ -644,23 +833,106 @@
    * The form only exists on that route, so filling it has to start by going
    * there — the panel is reachable from any page and the user may well be
    * sitting in the chat.
+   *
+   * Setting location.hash is enough for the SPA router to react, but pushing
+   * through history as well covers routers that only listen to popstate.
    */
   async function ensureMcpPage() {
-    if (location.hash.indexOf('#/mcp') === 0) return true;
-    location.hash = '#/mcp';
+    // "starts with #/mcp" is not enough. #/mcp/details/<id> is a detail page:
+    // no list on it and no 创建 button either. Treating it as the list made the
+    // flow hunt for the entry somewhere it cannot be, then fail on a missing
+    // button.
+    if (location.hash.indexOf('#/mcp') === 0 && location.hash.indexOf('/details/') === -1) return true;
+    try {
+      // Land on 我的创建 directly. Going to the default tab first and then
+      // switching means the list renders twice, and it is the second render the
+      // flow then sits waiting on.
+      location.hash = '#/mcp?tab=my&sort=hot&order=desc';
+      if (location.hash.indexOf('#/mcp') !== 0) {
+        history.pushState(null, '', location.pathname + location.search + '#/mcp?tab=my&sort=hot&order=desc');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      }
+    } catch (e) {
+      return false;
+    }
     return await waitForPage(function () {
-      return location.hash.indexOf('#/mcp') === 0 &&
-        !!document.querySelector('button,div[role=button]');
-    }, 15000);
+      // Wait for the route AND for the page's own content to arrive; the hash
+      // changes before the view is rendered.
+      return location.hash.indexOf('#/mcp') === 0 && !!findClickable('我的创建');
+    }, 12000);
   }
 
-  /** Switch to the 我的创建 tab, where an existing entry lives. */
+  /**
+   * Switch to the 我的创建 tab, and wait until it has actually taken effect.
+   *
+   * Navigating by URL rather than clicking the tab: the click is a request the
+   * router may or may not honour, and an earlier version accepted "the 创建
+   * button exists" as success — true on every tab — so the list silently stayed
+   * on 公开MCP, the existing entry was never found, and the flow went on to
+   * create a duplicate name that the server rejects.
+   */
   async function gotoMyTab() {
-    var tab = findClickable('我的创建');
-    if (!tab) return false;
-    tab.click();
-    await sleep(1500);
+    // Already on the list with entries on it? Nothing to re-route. The common
+    // case is the user sitting on the right page, and navigating away throws out
+    // a rendered list only to wait for it to render again.
+    if (location.hash.indexOf('tab=my') !== -1 && listToolNames().length > 0) return true;
+
+    var before = listToolNames().join('|');
+    if (location.hash.indexOf('tab=my') === -1) {
+      location.hash = '#/mcp?tab=my&sort=hot&order=desc';
+    }
+    // Short: the hash changes immediately, and the list either follows within a
+    // beat or it does not. Waiting longer only delays the conclusion.
+    return await waitForPage(function () {
+      return location.hash.indexOf('tab=my') !== -1 && listToolNames().join('|') !== before;
+    }, 8000);
+  }
+
+  /**
+   * Click an element the way a mouse would.
+   *
+   * mousedown/mouseup are dispatched first because card handlers sometimes
+   * listen for them, but the final click must be the native .click(): a
+   * synthetic MouseEvent does not trigger an anchor's default navigation, and
+   * the list cards are wrapped in links. Dispatching all three broke the
+   * navigation instead of improving it.
+   */
+  function realClick(el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    var opts = {
+      bubbles: true,
+      cancelable: true,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
+      view: window,
+    };
+    try {
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+    } catch (e) {
+      /* fall through to the native click */
+    }
+    el.click();
     return true;
+  }
+
+  /**
+   * Open an entry's detail page.
+   *
+   * The URL must change to a *different* details page: checking only for
+   * "/details/" was satisfied by the page the previous run left behind, so a
+   * failed click looked like a success and the flow then edited the wrong entry.
+   */
+  async function openDetail(name) {
+    var before = location.hash;
+    var card = findClickable(name);
+    if (!card) return false;
+    realClick(card);
+    return await waitForPage(function () {
+      return location.hash.indexOf('/details/') !== -1 && location.hash !== before;
+    }, 12000);
   }
 
   /** The header row's two inputs: the name box and the value box. */
@@ -817,7 +1089,7 @@
     tab.className = 'tab';
     var dot = el('span', null);
     dot.className = 'dot';
-    var label = el('span', null, '磐石桥接');
+    var label = el('span', null, 'ScienceOne桥接');
     tab.appendChild(dot);
     tab.appendChild(label);
     wrap.appendChild(tab);
@@ -856,7 +1128,7 @@
 
     var hd = el('div', null);
     hd.className = 'hd';
-    hd.appendChild(el('b', null, '磐石桌面桥接'));
+    hd.appendChild(el('b', null, 'ScienceOne桌面桥接'));
     var x = el('span', null, '✕');
     x.className = 'x';
     x.addEventListener('click', function () {
@@ -896,7 +1168,13 @@
     }
 
     row('MCP 服务', s.mcpRunning ? '运行中 · ' + s.mcpAddr + ' · ' + s.toolCount + ' 个工具' : '未运行');
+    row('隧道后端', s.tunnelProvider === 'frp' ? 'frp · 自建服务器'
+      : s.tunnelProvider === 'cloudflared' ? 'cloudflared · quick tunnel' : '—');
     row('公网隧道', s.tunnelUrl ? code(s.tunnelUrl) : s.tunnelState === 'starting' ? '正在建立…' : '未连接');
+    // The platform tests the address on save, so "the address exists" and "the
+    // address works" are two different facts and both are worth showing.
+    row('隧道可达', s.tunnelWarm ? '已自测通过'
+      : s.tunnelUrl ? '预热中…' + (s.tunnelWhy ? '（' + s.tunnelWhy + '）' : '') : '—');
     row('工作目录', s.workspace || '—');
     row('令牌', s.token ? code(s.token.slice(0, 12) + '…') : '未设置');
 
@@ -910,15 +1188,27 @@
       if (cls) b.className = cls;
       if (disabled || panelState.busy) b.disabled = true;
       b.addEventListener('click', function () {
-        fn().catch(function (e) {
+        // Not every action is async. Assuming a Promise here meant a synchronous
+        // one threw `fn(...).catch is not a function` straight into the void —
+        // the button looked dead.
+        try {
+          var r = fn();
+          if (r && typeof r.catch === 'function') {
+            r.catch(function (e) {
+              pushLog('失败: ' + e.message);
+            });
+          }
+        } catch (e) {
           pushLog('失败: ' + e.message);
-        });
+        }
       });
       acts.appendChild(b);
     }
 
-    act('一键填入磐石表单', 'primary', doFill, !s.mcpUrl);
+    act('一键填入ScienceOne表单', 'primary', function () { return doFill(false); }, !s.mcpUrl);
+    act('强制重填', null, function () { return doFill(true); }, !s.mcpUrl);
     act('探测页面结构', null, doProbe);
+    act('记录我的点击', null, recordClicks);
     act('复制配置', null, copyConfig);
     act('刷新状态', null, refresh);
     panel.appendChild(acts);
@@ -944,7 +1234,7 @@
     report('log: ' + msg);
     if (panelState.open) render();
   }
-  window.__panshiLog = pushLog;
+  window.__scienceoneLog = pushLog;
 
   async function refresh() {
     try {
@@ -976,16 +1266,28 @@
   // actions driven from the panel
   // -------------------------------------------------------------------------
 
+  // Labels that only ever occur inside the MCP entry form itself.
+  var FORM_MARKERS = /名称\s*\*|URL\s*\*|鉴权方式|说明文档/;
+
   function findFormScope() {
     // Prefer the innermost dialog or drawer, which is where the form lives when
     // it opens as an overlay.
     var dialogs = document.querySelectorAll(
       '[role=dialog],[class*=dialog],[class*=modal],[class*=drawer],[class*=Dialog],[class*=Modal]'
     );
+    var fallback = null;
     for (var i = dialogs.length - 1; i >= 0; i--) {
-      if (visible(dialogs[i]) && dialogs[i].querySelector('input,textarea')) return dialogs[i];
+      var d = dialogs[i];
+      if (!visible(d) || !d.querySelector('input,textarea')) continue;
+      // Only a container carrying the entry form's own field labels counts as
+      // the form. Accepting any visible dialog that merely holds an <input>
+      // matched persistent page chrome (search boxes) and leftover dialogs, so
+      // the scope never went away and a submit that had actually succeeded was
+      // reported as "form still open".
+      if (FORM_MARKERS.test(d.textContent || '')) return d;
+      if (!fallback) fallback = d;
     }
-    return document;
+    return fallback || document;
   }
 
   /** Open the create dialog, or null if it will not appear. */
@@ -1004,36 +1306,50 @@
     return opened === document ? null : opened;
   }
 
-  /** Tool names visible on the page, read off card titles. */
+  /**
+   * Tool names visible on the page, read off the card titles.
+   *
+   * Scoped to the cards. A looser selector that also matched "anything with
+   * 'item' in its class" picked up the sidebar's own list items, which pushed
+   * the real entries out of the first twelve results — so an entry that existed
+   * looked absent, and the flow went on to create a duplicate the platform then
+   * rejects.
+   */
   function listToolNames() {
     var out = [];
-    var cards = document.querySelectorAll('div[class*=card], li[class*=card], div[class*=item]');
-    for (var i = 0; i < cards.length; i++) {
-      var c = cards[i];
-      if (!visible(c)) continue;
-      var leaves = c.querySelectorAll('div,span,h3,h4,strong');
-      for (var j = 0; j < leaves.length; j++) {
-        var el = leaves[j];
-        if (el.children.length > 0) continue;
-        var t = (el.textContent || '').trim();
-        if (/^[A-Za-z][A-Za-z0-9_-]{2,40}$/.test(t)) {
-          out.push(t);
-          break;
-        }
+    var titles = document.querySelectorAll(
+      'article [class*=card-title], [class*=resource-card] [class*=card-title], h3[class*=card-title]'
+    );
+    for (var i = 0; i < titles.length; i++) {
+      var el = titles[i];
+      if (el.children.length > 0 || !visible(el)) continue;
+      var t = (el.textContent || '').trim();
+      if (/^[A-Za-z][A-Za-z0-9_-]{2,40}$/.test(t) && out.indexOf(t) === -1) {
+        out.push(t);
       }
     }
     return out;
   }
 
-  /** The name of whichever tool's detail page is open. */
+  /**
+   * The name of whichever entry's detail page is open.
+   *
+   * List cards must be excluded. The SPA keeps the list mounted behind the
+   * detail view, so a document-order scan found "local-dev-mcp" in the card grid
+   * before it ever reached the detail heading — which made a correct navigation
+   * look like it had opened the wrong entry.
+   */
   function currentToolName() {
     var heads = document.querySelectorAll('h1,h2,h3,[class*=title],[class*=name]');
     for (var i = 0; i < heads.length; i++) {
       var el = heads[i];
       if (!visible(el)) continue;
+      if (el.children.length > 0) continue;
+      // Skip anything that belongs to the list, not the detail view.
+      if (el.closest('article, [class*=cards-grid], [class*=card-title-row], [class*=resource-list]')) continue;
       var r = el.getBoundingClientRect();
-      if (r.left < 380) continue; // skip the left navigation column
-      if (r.top < 60) continue;
+      if (r.left < 300) continue; // the navigation column
+      if (r.top < 50) continue; // the window chrome
       var t = (el.textContent || '').trim();
       if (/^[A-Za-z][A-Za-z0-9_-]{2,40}$/.test(t)) return t;
     }
@@ -1048,16 +1364,50 @@
    * rather than re-created.
    */
   async function findExisting(name) {
-    await gotoMyTab();
-    if (listToolNames().indexOf(name) === -1) return null;
+    // Read what is already on screen before navigating anywhere.
+    if (listToolNames().indexOf(name) === -1) {
+      await gotoMyTab();
+    }
+    if (listToolNames().indexOf(name) === -1) {
+      // The list re-renders after the route change, so it can be legitimately
+      // empty for a moment. Wait for it to fill in rather than concluding the
+      // entry is absent and re-routing a second time.
+      await waitFor(function () { return listToolNames().length > 0; }, 4000);
+    }
+    var names = listToolNames();
+    if (names.indexOf(name) === -1) {
+      // Reported so a mis-navigated tab is distinguishable from an entry that
+      // genuinely is not there.
+      report('findExisting: not in list', {
+        hash: location.hash,
+        seen: names.slice(0, 12),
+      });
+      return null;
+    }
 
-    var card = findClickable(name);
-    if (!card) return null;
-    card.click();
-    await sleep(2500);
+    if (!(await openDetail(name))) {
+      report('findExisting: detail did not open', { hash: location.hash });
+      return null;
+    }
 
-    var shown = currentToolName();
-    if (shown && shown !== name) return null; // landed on the wrong card
+    // The title must match. Accepting an unknown title was the bug that made the
+    // flow edit the wrong entry: the list holds two servers with identical
+    // descriptions, so a mis-targeted click looked like a success.
+    // The title must match, but an unreadable title is not evidence of the wrong
+    // entry: the card was found by name and the route did change. Rejecting on
+    // "could not read it" sent the flow into the create path from a detail page
+    // that has no create button, so it failed with a message about a missing
+    // button. Only a *mismatch* is a rejection.
+    var shown = await waitFor(function () {
+      return currentToolName();
+    }, 10000);
+    if (shown && shown !== name) {
+      report('findExisting: opened the wrong entry', { shown: shown, wanted: name });
+      return null;
+    }
+    if (!shown) {
+      report('findExisting: detail title unreadable, accepting on route change', { name: name });
+    }
     return { name: name, page: location.href };
   }
 
@@ -1069,14 +1419,15 @@
 
     var current = String(field.el.value || '').trim();
     if (current === cfg.mcpUrl) {
-      return [{ field: 'url', ok: true, detail: 'already current' }];
+      report.push({ field: 'url', ok: true, detail: 'already current' });
+    } else {
+      setValue(field.el, cfg.mcpUrl);
+      report.push({
+        field: 'url',
+        ok: true,
+        detail: 'replaced ' + (current ? current.slice(0, 44) : '(empty)') + ' -> ' + cfg.mcpUrl.slice(0, 44),
+      });
     }
-    setValue(field.el, cfg.mcpUrl);
-    report.push({
-      field: 'url',
-      ok: true,
-      detail: 'replaced ' + current.slice(0, 44) + ' -> ' + cfg.mcpUrl.slice(0, 44),
-    });
 
     // The header carries the token, so refresh it alongside the address.
     var boxes = headerBoxes(scope);
@@ -1088,7 +1439,74 @@
       if (valueBox) setValue(valueBox.el, eq === -1 ? '' : cfg.headers.slice(eq + 1));
       report.push({ field: 'headers', ok: !!valueBox, detail: 'refreshed' });
     }
+
+    // 说明文档 is required on the edit form as well. Without re-attaching it the
+    // submit is rejected by validation, which shows no message at all.
+    if (cfg.documentContent && !docAlreadyShown(scope, cfg.documentName)) {
+      var doc = await attachDocument(scope, cfg.documentName || 'local-dev-mcp.md', cfg.documentContent);
+      report.push({ field: 'document', ok: doc.ok, detail: doc.detail });
+    } else if (cfg.documentContent) {
+      report.push({ field: 'document', ok: true, detail: 'already attached' });
+    }
     return report;
+  }
+
+  /** Whether the upload widget already shows this file. */
+  function docAlreadyShown(scope, name) {
+    if (!name) return false;
+    var els = (scope || document).querySelectorAll('div,span,strong,p,li');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.children.length > 0 || !visible(el)) continue;
+      if ((el.textContent || '').indexOf(name) !== -1) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Wait until the entry form is gone from the document.
+   *
+   * This is the only reliable success signal. Watching the dialog element does
+   * not work: the platform keeps other elements whose class contains "dialog"
+   * and the view it navigates to after a successful save has dialogs of its
+   * own, so a scope-based check stayed "open" forever and reported a save that
+   * had in fact gone through as a failure.
+   */
+  async function waitFormGone(ms) {
+    var deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (!findField('url', 'text', document)) return true;
+      await sleep(200);
+    }
+    return false;
+  }
+
+  /**
+   * Read the dialog the platform shows after a save, without dismissing it.
+   *
+   * The platform reports its verdict here rather than in the form: a rejected
+   * save arrives as "更新失败 / 疑似原因：目标 URL 不可达". Clicking that away
+   * without reading it made every failure look like a success, so the text is
+   * carried back out.
+   *
+   * Both buttons are returned because the choice matters: 关闭 discards the
+   * filled form, while 返回修改 puts it back. A caller that intends to retry
+   * needs the latter.
+   */
+  function readResultDialog(scope) {
+    var root = scope && scope !== document && document.contains(scope) ? scope : document;
+    var labels = ['关闭', '知道了', '确定', '完成', '返回修改'];
+    for (var i = 0; i < labels.length; i++) {
+      var btn = findClickable(labels[i], root);
+      if (!btn) continue;
+      var box = btn.closest('[role=dialog],[class*=dialog],[class*=modal]') || btn.parentElement;
+      return {
+        said: box ? (box.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 140) : '',
+        close: findClickable('关闭', root) || findClickable('知道了', root) || btn,
+        back: findClickable('返回修改', root) || null,
+      };
+    }
+    return null;
   }
 
   /**
@@ -1098,84 +1516,262 @@
    * create form says "确认". Matching on the bare word alone silently missed the
    * update case, leaving the dialog open while the log claimed success — so the
    * longer, more specific labels are tried first.
-   *
-   * Success is judged by whether the form element itself left the document.
-   * Counting dialogs page-wide does not work: the platform keeps other elements
-   * whose class contains "dialog", so the count never drops.
    */
   async function saveForm(scope) {
     var labels = ['确认更新', '确认修改', '保存修改', '确认创建', '确认提交', '保存', '提交', '确认', '确定'];
+
+    // Anchor the search to the container that holds the URL field.
+    //
+    // Searching from `document` picks up whatever button comes first in document
+    // order, which on this platform is a hidden create dialog — so the click went
+    // somewhere invisible while the visible form stayed open.
+    var anchor = null;
+    var urlField = findField('url', 'text', document);
+    if (urlField) {
+      var cur = urlField.el;
+      for (var d = 0; d < 10 && cur && cur !== document.body; d++) {
+        if (cur.querySelector && cur.querySelector('button')) {
+          anchor = cur;
+          break;
+        }
+        cur = cur.parentElement;
+      }
+    }
+    var searchRoot = anchor || (scope && scope !== document ? scope : document);
+
     var btn = null;
     for (var i = 0; i < labels.length && !btn; i++) {
-      btn = findClickable(labels[i], scope);
+      btn = findClickable(labels[i], searchRoot);
+    }
+    if (!btn && searchRoot !== document) {
+      // Fall back to the wider document only if the anchored search found nothing.
+      for (var k = 0; k < labels.length && !btn; k++) {
+        btn = findClickable(labels[k], document);
+      }
     }
     if (!btn) return { ok: false, detail: '未找到保存按钮' };
 
     var label = (btn.textContent || '').trim();
-    btn.click();
-    await sleep(3000);
 
-    // The form we just submitted should be gone; a still-attached form means a
-    // validation error kept it open.
-    var stillOpen = scope && scope !== document && document.contains(scope) &&
-      scope.getBoundingClientRect().width > 0;
-    if (stillOpen) {
-      var errs = [];
-      var nodes = scope.querySelectorAll('[class*=error],[class*=Error],[class*=danger]');
-      for (var j = 0; j < nodes.length; j++) {
-        var t = (nodes[j].textContent || '').trim();
-        if (t && t.length < 60) errs.push(t);
+    // An attached document is processed asynchronously; submitting immediately
+    // gets rejected by validation without any visible message. Retry a few
+    // times rather than reporting a failure the user cannot act on.
+    for (var attempt = 0; attempt < 6; attempt++) {
+      // Native click, and a real one at the element's own coordinates: the
+      // component-library button ignores a bare synthetic event.
+      realClick(btn);
+
+      if (!(await waitFormGone(9000))) {
+        // Re-resolve: a re-render replaces the button element, and its label can
+        // change for the duration of a submit.
+        var again = null;
+        for (var j = 0; j < labels.length && !again; j++) {
+          again = findClickable(labels[j], searchRoot);
+        }
+        if (!again && searchRoot !== document) again = findClickable(label, document);
+        if (!again) break;
+        btn = again;
+        continue;
+      }
+
+      await sleep(600);
+      var dlg = readResultDialog(scope);
+      var said = dlg ? dlg.said : '';
+      // The platform reports a rejected save in that dialog, not in the form, so
+      // "the dialog closed" is not success.
+      var blocked = /不可达|无法连接|连接失败|保存失败|更新失败/.test(said);
+
+      if (blocked && dlg && dlg.back && attempt < 4) {
+        // It refused because its own connectivity check did not get through.
+        // That is a statement about the network right now, not about the form —
+        // and the tunnel frequently comes up moments later. 返回修改 puts the
+        // filled form back, so retry from there rather than making the user
+        // start over.
+        pushLog('平台没连上隧道，20 秒后重试（第 ' + (attempt + 2) + ' 次）…');
+        realClick(dlg.back);
+        await sleep(20000);
+        var back = findField('url', 'text', document)
+          ? findClickable('确认更新', searchRoot) || findClickable('确认更新', document)
+          : null;
+        if (!back) break;
+        btn = back;
+        continue;
+      }
+
+      if (dlg && dlg.close) {
+        realClick(dlg.close);
+        await sleep(400);
       }
       return {
-        ok: false,
-        detail: '点了「' + label + '」但表单仍开着' + (errs.length ? '：' + errs.slice(0, 3).join(' / ') : ''),
+        ok: !blocked,
+        detail: '已点「' + label + '」' + (said ? '｜平台提示：' + said : '，表单已提交并关闭'),
       };
     }
-    return { ok: true, detail: '已点「' + label + '」，表单已提交并关闭' };
+
+    var errs = [];
+    var root = scope && scope !== document && document.contains(scope) ? scope : document;
+    var nodes = root.querySelectorAll('*');
+    for (var n = 0; n < nodes.length; n++) {
+      var el = nodes[n];
+      if (el.children.length > 0) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      var t = (el.textContent || '').trim();
+      if (!t || t.length > 50) continue;
+      if (/必填|必选|不能为空|请选择|请上传|请填写|格式|required|invalid/i.test(t)) errs.push(t);
+    }
+    // Nothing matched: hand back the form's own text rather than reporting "no
+    // visible error", which reads as a mystery when it is usually a plain
+    // validation line the regex above simply did not recognise.
+    var tail = '';
+    if (!errs.length && root !== document) {
+      tail = (root.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    }
+    return {
+      ok: false,
+      detail: '点了「' + label + '」但表单仍开着' +
+        (errs.length ? '：' + errs.slice(0, 3).join(' / ') : tail ? '：' + tail : '（无可见错误）'),
+    };
   }
 
-  async function doFill() {
+  async function doFill(forceRefill, retriedExisting) {
     panelState.busy = true;
+    // Collapse the panel while driving the page: it sits over the top-right
+    // corner, which is exactly where the platform puts 编辑 and 删除.
+    var wasOpen = panelState.open;
+    panelState.open = false;
+    if (panelState.panelEl) panelState.panelEl.style.display = 'none';
+    blockInput(true);
     render();
     pushLog('开始填入…');
     try {
+      // Wait for the address, but NOT for it to become reachable.
+      //
+      // An earlier version blocked here until the tunnel answered, which on a
+      // slow launch meant minutes of nothing happening after a click — from the
+      // outside indistinguishable from a hang. The address is all the form
+      // needs; whether the platform can reach it is a separate fight, reported
+      // where it actually happens.
+      pushLog('等待公网隧道…');
       var cfg = await call('fillConfig');
-      if (cfg.error) throw new Error(cfg.error);
+      for (var attempt = 0; attempt < 15 && cfg.error; attempt++) {
+        await sleep(2000);
+        cfg = await call('fillConfig');
+      }
+      if (cfg.error) {
+        pushLog('隧道未就绪（' + cfg.error + '），请稍后再点一次');
+        return;
+      }
+      if (!cfg.warm) {
+        // A warmup failure describes *this* machine's network, not the
+        // platform's. On the machine this was developed on, the local resolver
+        // could not resolve *.trycloudflare.com at all (immediate NXDOMAIN)
+        // while 223.5.5.5 and 8.8.8.8 both resolved it fine — the platform, with
+        // its own DNS, still saved the entry successfully. So warn, do not stop.
+        pushLog('（本机探测隧道失败：' + (cfg.warmWhy || '原因未知') + '）');
+        pushLog('这只是本机网络的结论——平台用自己那套 DNS，仍然可能连上。继续填表。');
+      }
+      pushLog('拿到配置：' + cfg.name + ' / ' + cfg.mcpUrl);
+
+      // Nothing to do when the platform already holds this exact address. That
+      // is the normal case on every launch after the first, and re-submitting
+      // identical values re-uploads the document and re-runs the platform's
+      // connectivity check for no reason. 「强制重填」 overrides this.
+      if (!forceRefill && lastSavedURL() === cfg.mcpUrl) {
+        pushLog('✓ 平台里已经是这个地址，跳过填表');
+        pushLog('（隧道地址没变。要强制覆盖请点「强制重填」）');
+        var en0 = await enableInChat(cfg);
+        pushLog((en0.ok ? '✓ ' : '✗ ') + 'enable — ' + en0.detail);
+        return;
+      }
 
       // The panel is reachable from any page, so the flow starts by navigating
       // to the MCP management page rather than assuming the user is already there.
       pushLog('进入 MCP 工具页…');
       if (!(await ensureMcpPage())) {
-        pushLog('导航到 MCP 页失败，请在页面上手动打开后重试');
+        pushLog('导航失败，当前 hash=' + location.hash);
         return;
       }
-      await sleep(2000);
+      pushLog('已在 ' + location.hash);
+      await sleep(2500);
+
+      // Say which side is broken when the platform refuses the address. The two
+      // causes look identical on screen but need opposite responses: a tunnel
+      // that never came up is worth retrying, while one that works locally but
+      // not from the platform is a routing problem only another tunnel fixes.
+      var explainUnreachable = function (saved) {
+        if (!/不可达|无法连接|连接失败|更新失败|保存失败/.test(saved.detail)) return;
+        if (cfg.warm) {
+          pushLog('本机自测这条隧道是通的，平台却连不上——这是平台到 Cloudflare 的线路问题，本程序修不了。');
+          pushLog('按 README 的「能固定地址吗」换成自建 frp（启动加 -tunnel frp 那一组参数）。');
+        } else {
+          pushLog('这条隧道本机自测也不通：' + (cfg.warmWhy || '原因未知'));
+          pushLog('检查网络后重试；持续不通就换 frp。');
+        }
+      };
 
       // Re-use an existing entry: a duplicate name is rejected, and the tunnel
       // address differs every launch, so the old one has to be updated.
       var existing = await findExisting(cfg.name);
       if (existing) {
         pushLog('发现已创建的「' + cfg.name + '」，改走更新');
-        var editScope = findFormScope();
-        if (editScope === document) {
+        // The edit form may be a dialog, or a form rendered inline on the detail
+        // page. Waiting for the URL field itself covers both, whereas waiting for
+        // a dialog only covered the first.
+        var urlField = findField('url', 'text', document);
+        if (!urlField) {
           var editBtn = findClickable('编辑') || findClickable('修改');
-          if (editBtn) {
-            editBtn.click();
-            await sleep(2500);
-            editScope = findFormScope();
+          if (!editBtn) {
+            pushLog('详情页上没有「编辑」入口（' + location.hash + '）');
+            return;
           }
+          realClick(editBtn);
+          await waitForPage(function () {
+            return !!findField('url', 'text', document);
+          }, 10000);
+          urlField = findField('url', 'text', document);
         }
-        if (editScope === document) {
-          pushLog('打开了详情页但没有编辑入口，请手动点「编辑」后再试');
+        if (!urlField) {
+          pushLog('点了「编辑」但没出现 URL 字段，请手动打开编辑表单后重试');
           return;
         }
-        var upd = await updateUrl(editScope, cfg);
-        upd.forEach(function (r) {
-          pushLog((r.ok ? '✓ ' : '✗ ') + r.field + ' — ' + r.detail);
+
+        // The edit form opens blank on this platform — it does not back-fill the
+        // saved values — so a partial update leaves six required fields empty and
+        // validation rejects the submit with no visible message. Fill the whole
+        // form exactly as the create path does.
+        var editScope = urlField.el.closest('form') || findFormScope();
+        if (editScope === document) editScope = document;
+
+        // The address is the whole point of an update, and the edit form
+        // back-fills the OLD one — so it is set and reported explicitly, with
+        // both values in the log. Folding it into the generic field pass made a
+        // silent no-op ("found the control, set a value") look identical to a
+        // real replacement, which is how the address stayed stale across every
+        // "successful" update.
+        var urlReport = await updateUrl(editScope, cfg);
+        urlReport.forEach(function (r) {
+          if (r.field !== 'url') return; // the pass below covers the other fields
+          pushLog((r.ok ? '✓ ' : '✗ ') + 'url — ' + r.detail);
         });
+
+        var filled = await fillForm(cfg, editScope);
+        filled.forEach(function (r) {
+          if (r.field === 'url') return; // reported by updateUrl, with the diff
+          pushLog((r.ok ? '✓ ' : '✗ ') + r.field + (r.detail ? ' — ' + r.detail : ''));
+        });
+        var bad = filled.filter(function (r) { return !r.ok; }).length;
+        if (bad) {
+          pushLog('有 ' + bad + ' 个字段没填上，请核对后再点确认更新');
+          return;
+        }
         var saved = await saveForm(editScope);
         pushLog((saved.ok ? '✓ ' : '✗ ') + 'save — ' + saved.detail);
-        if (!saved.ok) return;
+        if (!saved.ok) {
+          explainUnreachable(saved);
+          return;
+        }
+        markSavedURL(cfg.mcpUrl);
       } else {
         var scope = await openCreateDialog();
         if (!scope) {
@@ -1196,138 +1792,204 @@
         }
         var created = await saveForm(scope);
         pushLog((created.ok ? '✓ ' : '✗ ') + 'save — ' + created.detail);
-        if (!created.ok) return;
+        if (!created.ok) {
+          explainUnreachable(created);
+          // 该名称已被使用 is proof the entry exists and the lookup was simply
+          // too early — this list takes tens of seconds to render. Close the
+          // dialog and run the whole flow once more, which will now find it and
+          // take the update path.
+          if (!retriedExisting && /已被使用|已存在|重复/.test(created.detail)) {
+            pushLog('这个名称已经存在：刚才列表还没渲染出来。关掉创建框重来一次…');
+            var cancel = findClickable('取消', document) || findClickable('关闭', document);
+            if (cancel) realClick(cancel);
+            await sleep(2500);
+            return await doFill(forceRefill, true);
+          }
+          return;
+        }
+        markSavedURL(cfg.mcpUrl);
       }
 
-      // Finally, switch the server on in the chat. Creating it is not enough:
-      // an MCP that is not enabled is invisible to the model.
-      pushLog('回到对话页启用 ' + cfg.name + '…');
+      // Finally get the user to the chat page. Creating the entry is not
+      // enough: the composer only offers servers that are switched on, and that
+      // switch sits behind a menu this automation deliberately does not click.
+      pushLog('启用对话页里的 ' + cfg.name + '…');
       var en = await enableInChat(cfg);
-      pushLog((en.ok ? '✓ ' : '✗ ') + 'enable — ' + en.detail + '（' + en.steps.join(' → ') + '）');
-      pushLog(en.ok ? '全部完成' : '请手动在对话页的工具菜单里启用');
+      pushLog((en.ok ? '✓ ' : '✗ ') + 'enable — ' + en.detail);
+      if (en.ok) pushLog('全部完成，模型现在可以调用本机了');
+    } catch (err) {
+      pushLog('失败：' + (err && err.message ? err.message : String(err)));
     } finally {
       panelState.busy = false;
+      blockInput(false);
+      // Bring the panel back so the run's log is readable.
+      panelState.open = wasOpen;
+      if (panelState.panelEl) panelState.panelEl.style.display = wasOpen ? 'block' : 'none';
       render();
     }
   }
 
   /**
-   * Enable our MCP in the chat composer.
+   * Switch our MCP on in the chat composer.
    *
-   * The chat page keeps a tool menu behind the "/" affordance next to the input
-   * box: its MCP row opens a panel headed 已启用的 MCP that lists every server
-   * with a toggle. A freshly created server is not enabled by default, so this
-   * has to be switched on or the model can never call it.
+   * Creating the entry is not enough: the platform only offers MCP tools that
+   * are switched on, and a new entry starts off. The platform names the tools it
+   * exposes to the model `mcp_<server>_<tool>`, so an entry that was never
+   * switched on simply does not exist as far as the model is concerned — which
+   * looks exactly like a broken tunnel from the outside.
+   *
+   * The switch is four levels down a chain of component-library menus, each of
+   * which only exists while the one above it is open:
+   *
+   *   composer → the ⌘ menu → MCP → 管理我的MCP → the card's .w-switch
+   *
+   * Every selector here was read off a recording of the real clicks, because the
+   * menus do not render for synthetic events and cannot be found by probing.
    */
+  /**
+   * The ⌘ button that opens the composer's tool menu.
+   *
+   * It sits between the attach button and 深度研究, inside div.left-origin. It is
+   * matched by that anchor rather than by position, because the only thing
+   * distinguishing it from the buttons on either side is its class, and
+   * w-btn-shape-square is shared.
+   */
+  function findToolMenuButton() {
+    var candidates = document.querySelectorAll('button.w-btn-shape-square');
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i].getBoundingClientRect().height === 0) continue;
+      var box = candidates[i].closest('div.left-origin') || candidates[i].parentElement;
+      if (box && (box.textContent || '').indexOf('深度研究') !== -1) return candidates[i];
+    }
+    return null;
+  }
+
   async function enableInChat(cfg) {
     var steps = [];
 
-    // 1. go to the chat page
+    // Wait for the button itself, not for the route. The hash changes before the
+    // view renders, and checking "am I already on the chat page" skipped the
+    // wait entirely when the flow had started there — so the button was looked
+    // for on a page that had not drawn it yet, and the whole step failed in the
+    // same second it began.
     if (location.hash.indexOf('#/assistant') !== 0) {
       location.hash = '#/assistant';
-      await waitForPage(function () {
-        return !!document.querySelector('textarea');
-      }, 15000);
     }
-    steps.push('在对话页');
+    var ready = await waitForPage(function () {
+      return !!findToolMenuButton();
+    }, 25000);
+    if (!ready) {
+      return { ok: false, steps: steps, detail: '对话页的 ⌘ 按钮没出现' };
+    }
+    steps.push('已切到对话页');
 
-    // 2. open the tool menu: the button sits to the right of the attach button
-    var ta = document.querySelector('textarea.w-textarea') || document.querySelector('textarea');
-    if (!ta) {
-      return { ok: false, steps: steps, detail: '找不到输入框' };
+    var trigger = findToolMenuButton();
+    realClick(trigger);
+    await sleep(1500);
+    steps.push('打开工具菜单');
+
+    // 2. the MCP section
+    if (!(await clickOwnText('div.flex.w-full.items-center', 'MCP'))) {
+      return { ok: false, steps: steps, detail: '工具菜单里没有 MCP 分区' };
     }
-    var trigger = findToolMenuButton(ta);
-    if (!trigger) {
-      return { ok: false, steps: steps, detail: '找不到工具菜单按钮' };
-    }
-    trigger.click();
     await sleep(1200);
+    steps.push('展开 MCP');
 
-    // 3. open the MCP row
-    var mcpRow = findClickable('MCP');
-    if (!mcpRow) {
-      return { ok: false, steps: steps, detail: '工具菜单里没有 MCP 项' };
+    // 3. the management panel
+    if (!(await clickOwnText('span', '管理我的MCP'))) {
+      return { ok: false, steps: steps, detail: '没有「管理我的MCP」入口' };
     }
-    mcpRow.click();
-    await sleep(1200);
-    steps.push('打开 MCP 面板');
+    steps.push('打开管理面板');
 
-    // 4. find our entry and turn it on
-    var row = findMcpRow(cfg.name);
-    if (!row) {
-      // The panel may need a scroll before the entry is present.
-      await sleep(1200);
-      row = findMcpRow(cfg.name);
+    // 4. our card's switch
+    var list = null;
+    for (var t = 0; t < 25 && !list; t++) {
+      list = document.querySelector('div.mcp-grid-list');
+      if (!list) await sleep(300);
     }
-    if (!row) {
-      return { ok: false, steps: steps, detail: '列表里没有 ' + cfg.name };
+    if (!list) return { ok: false, steps: steps, detail: '管理面板没有打开' };
+
+    var cards = list.querySelectorAll('div.w-list-item');
+    var target = null;
+    for (var c = 0; c < cards.length; c++) {
+      var nm = (cards[c].querySelector('span') || {}).textContent || '';
+      if (nm.trim() === cfg.name) {
+        target = cards[c];
+        break;
+      }
     }
-    if (row.enabled) {
+    if (!target) return { ok: false, steps: steps, detail: '列表里没有 ' + cfg.name };
+
+    var sw = target.querySelector('.w-switch');
+    if (!sw) return { ok: false, steps: steps, detail: cfg.name + ' 那一行没有开关' };
+
+    // The component library marks the on state with a class, not a property.
+    if (/checked/.test(String(sw.className))) {
+      await closeDialog();
       return { ok: true, steps: steps, detail: cfg.name + ' 已经是启用状态' };
     }
-    (row.toggle || row.el).click();
-    await sleep(1200);
 
-    var after = findMcpRow(cfg.name);
+    realClick(sw);
+    await sleep(2200);
+
+    // Look the card up again rather than reusing `target`. Flipping the switch
+    // re-renders the list, and the old node reference goes stale — reading its
+    // class then reported "did not turn on" for a switch that had in fact just
+    // turned on.
+    var freshCard = null;
+    var again = list.querySelectorAll('div.w-list-item');
+    for (var d = 0; d < again.length; d++) {
+      var nm2 = (again[d].querySelector('span') || {}).textContent || '';
+      if (nm2.trim() === cfg.name) {
+        freshCard = again[d];
+        break;
+      }
+    }
+    var after = freshCard ? freshCard.querySelector('.w-switch') : null;
+    var on = !!after && /checked/.test(String(after.className));
+    await closeDialog();
     return {
-      ok: !!(after && after.enabled),
+      ok: on,
       steps: steps,
-      detail: after && after.enabled ? cfg.name + ' 已启用' : '点了开关但状态未变',
+      detail: on ? cfg.name + ' 已启用' : '点了开关但没有变成启用态',
     };
   }
 
-  /** The "/" tool button beside the composer. */
-  function findToolMenuButton(textarea) {
-    var r = textarea.getBoundingClientRect();
-    var els = document.querySelectorAll('button,div,span');
-    var best = null;
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      var b = el.getBoundingClientRect();
-      if (b.width === 0 || b.height === 0) continue;
-      // Same row as the composer, to its left, above the send button.
-      if (b.top < r.top + r.height * 0.4 || b.top > r.bottom + 40) continue;
-      if (b.left < r.left - 40 || b.left > r.left + r.width * 0.5) continue;
-      var cls = String(el.className || '');
-      if (!/btn|icon|tool|menu/i.test(cls)) continue;
-      if (!best || b.left > best.left) best = { el: el, left: b.left };
+  /** Click the first visible element of `selector` whose own text is exactly `text`. */
+  async function clickOwnText(selector, text) {
+    for (var i = 0; i < 25; i++) {
+      var els = document.querySelectorAll(selector);
+      for (var k = 0; k < els.length; k++) {
+        var el = els[k];
+        if (el.getBoundingClientRect().height === 0) continue;
+        var own = '';
+        for (var n = 0; n < el.childNodes.length; n++) {
+          if (el.childNodes[n].nodeType === 3) own += el.childNodes[n].textContent;
+        }
+        if (own.trim() !== text) continue;
+        realClick(el);
+        return true;
+      }
+      await sleep(300);
     }
-    return best ? best.el : null;
+    return false;
   }
 
-  /**
-   * Locate a server's row in the 已启用的 MCP panel, with its toggle state.
-   *
-   * The switch is a component-library control rather than a checkbox, so the
-   * state is read from its class list ("checked"/"active"/"on") and the click
-   * target is the switch element itself.
-   */
-  function findMcpRow(name) {
-    var els = document.querySelectorAll('div,li,section');
-    var row = null;
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      if (!visible(el)) continue;
-      var own = '';
-      for (var k = 0; k < el.childNodes.length; k++) {
-        if (el.childNodes[k].nodeType === 3) own += el.childNodes[k].textContent;
+  /** Dismiss whichever modal is open. */
+  async function closeDialog() {
+    await sleep(600);
+    var labels = ['取消', '关闭'];
+    var btns = document.querySelectorAll('button');
+    for (var i = 0; i < labels.length; i++) {
+      for (var k = 0; k < btns.length; k++) {
+        if ((btns[k].textContent || '').trim() !== labels[i]) continue;
+        if (btns[k].getBoundingClientRect().height === 0) continue;
+        realClick(btns[k]);
+        await sleep(500);
+        return true;
       }
-      var t = (el.textContent || '').trim();
-      if (t.indexOf(name) === -1) continue;
-      if (t.length > 60) continue; // too wide to be the row
-      row = el;
     }
-    if (!row) return null;
-
-    var sw = row.querySelector('[class*=switch],[class*=Switch],[class*=toggle],[class*=Toggle],input[type=checkbox],[role=switch]');
-    var enabled = false;
-    if (sw) {
-      var cls = String(sw.className || '');
-      if (/checked|active|on\b|open/i.test(cls)) enabled = true;
-      if (sw.checked === true) enabled = true;
-      if (sw.getAttribute && sw.getAttribute('aria-checked') === 'true') enabled = true;
-    }
-    return { el: row, toggle: sw, enabled: enabled };
+    return false;
   }
 
   async function doProbe() {
@@ -1339,12 +2001,12 @@
     } catch (e) {
       pushLog('保存失败: ' + e.message);
     }
-    console.log('[panshi-desktop] probe', info);
+    console.log('[scienceone-desktop] probe', info);
     return info;
   }
 
   // exposed for the console, so the automation can be driven by hand
-  window.__panshiDesktopAPI = {
+  window.__scienceoneDesktopAPI = {
     probe: probe,
     fill: doFill,
     fillForm: fillForm,
@@ -1359,6 +2021,7 @@
     currentToolName: currentToolName,
     updateUrl: updateUrl,
     findClickable: findClickable,
+    recordClicks: recordClicks,
   };
 
   // -------------------------------------------------------------------------
